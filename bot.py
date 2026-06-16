@@ -1,6 +1,8 @@
 # v3
+# v4
 import logging
 import os
+import base58
 from datetime import date
 from dotenv import load_dotenv
 from telegram import Update
@@ -8,30 +10,30 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ContextTypes, filters
 )
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.system_program import transfer, TransferParams
+from solders.message import Message
+from solders.transaction import Transaction as SoldersTransaction
+from solana.rpc.async_api import AsyncClient
 from database import (
     init_db, get_or_create_user, upsert_daily,
     add_social_proof, get_leaderboard, get_user_stats,
     get_user_rank, get_pending_submissions,
     approve_submission, reject_submission,
-    get_today_activity
+    get_today_activity,
+    can_request_faucet, record_faucet_request
 )
-import base58
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction
-from solana.system_program import transfer, TransferParams
-from database import can_request_faucet, record_faucet_request
 
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
 TREASURY_PRIVATE_KEY = os.getenv("TREASURY_PRIVATE_KEY")
 SOLANA_RPC = "https://api.devnet.solana.com"
 
-
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
-
 logging.basicConfig(level=logging.INFO)
+
 
 def get_medal(rank):
     if rank == 1: return "👑"
@@ -40,29 +42,31 @@ def get_medal(rank):
     if rank <= 10: return "⭐️"
     return "🌱"
 
+
 def get_tier(points):
     if points >= 2000: return "👑 Legendary"
     if points >= 1000: return "💎 Diamond"
-    if points >= 500:  return "🥇 Gold"
-    if points >= 200:  return "⭐️ Silver"
-    if points >= 50:   return "🌱 Bronze"
+    if points >= 500: return "🥇 Gold"
+    if points >= 200: return "⭐️ Silver"
+    if points >= 50: return "🌱 Bronze"
     return "❌ Inactive"
 
-    async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await get_or_create_user(user.id, user.username or user.first_name)
     await update.message.reply_text(
-    f"👋 Yo {user.first_name}!\n\n"
-    "Selamat datang ke Beta Tester Bot 🚀\n\n"
-    "📋 Commands:\n"
-    "/score — Score kau hari ni\n"
-    "/rank — Rank & tier kau\n"
-    "/leaderboard — Top 20\n"
-    "/submit [link] — Submit social proof\n"
-    "/rules — Cara kira points\n"
-    "/faucet [wallet] — Dapat 1 SOL devnet (1x/hari)\n"
-    "/checkbalance [wallet] — Check balance devnet"
-)
+        f"👋 Yo {user.first_name}!\n\n"
+        "Selamat datang ke Beta Tester Bot 🚀\n\n"
+        "📋 Commands:\n"
+        "/score — Score kau hari ni\n"
+        "/rank — Rank & tier kau\n"
+        "/leaderboard — Top 20\n"
+        "/submit [link] — Submit social proof\n"
+        "/rules — Cara kira points\n"
+        "/faucet [wallet] — Dapat 1 SOL devnet (1x/hari)\n"
+        "/checkbalance [wallet] — Check balance devnet"
+    )
 
 
 async def rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -76,6 +80,7 @@ async def rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "❌ Fake link: -50pt + ban",
         parse_mode="Markdown"
     )
+
 
 async def score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -97,6 +102,7 @@ async def score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 async def rank_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await get_or_create_user(user.id, user.username or user.first_name)
@@ -113,6 +119,7 @@ async def rank_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = await get_leaderboard()
     if not rows:
@@ -122,6 +129,7 @@ async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for i, (username, pts) in enumerate(rows, 1):
         text += f"{get_medal(i)} #{i} {username} — {pts} pts\n"
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -136,6 +144,7 @@ async def submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok, msg = await add_social_proof(user.id, user.username or user.first_name, link)
     await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
 
+
 async def pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -149,6 +158,7 @@ async def pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text += "Guna /approve [id] atau /reject [id]"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -157,6 +167,7 @@ async def approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ok = await approve_submission(int(ctx.args[0]))
     await update.message.reply_text("✅ Approved! +20pts dah masuk." if ok else "❌ ID tak jumpa.")
+
 
 async def reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -167,20 +178,8 @@ async def reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reject_submission(int(ctx.args[0]))
     await update.message.reply_text("❌ Rejected.")
 
-async def track_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.is_bot:
-        return
-    await get_or_create_user(user.id, user.username or user.first_name)
-    today = date.today().isoformat()
-    if update.message.reply_to_message:
-        await upsert_daily(user.id, today, "replies", 3, 15)
-    else:
-        await upsert_daily(user.id, today, "messages", 1, 20)
 
 async def faucet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
     if not ctx.args:
         await update.message.reply_text(
             "❌ Usage: /faucet <wallet_address>\n"
@@ -190,58 +189,47 @@ async def faucet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wallet_address = ctx.args[0].strip()
 
-    # Validate wallet address
     try:
         dest_pubkey = Pubkey.from_string(wallet_address)
     except Exception:
         await update.message.reply_text("❌ Wallet address tidak valid.")
         return
 
-    # Check cooldown
     allowed = await can_request_faucet(wallet_address)
     if not allowed:
         await update.message.reply_text(
-            f"⏳ Wallet ini dah request hari ni.\n"
-            f"Limit: 1 SOL per wallet per hari.\n"
-            f"Cuba lagi esok!"
+            "⏳ Wallet ni dah request hari ni.\n"
+            "Limit: 1 SOL per wallet per hari.\n"
+            "Cuba lagi esok!"
         )
         return
 
     await update.message.reply_text("⏳ Processing... Tunggu sekejap.")
 
     try:
-        # Load treasury keypair
         secret = base58.b58decode(TREASURY_PRIVATE_KEY)
         treasury = Keypair.from_bytes(secret)
 
         client = AsyncClient(SOLANA_RPC)
 
-        # Get latest blockhash
         blockhash_resp = await client.get_latest_blockhash()
         blockhash = blockhash_resp.value.blockhash
 
-        # Build transfer transaction (1 SOL = 1_000_000_000 lamports)
-        txn = Transaction()
-        txn.recent_blockhash = blockhash
-        txn.fee_payer = treasury.pubkey()
-        txn.add(
-            transfer(
-                TransferParams(
-                    from_pubkey=treasury.pubkey(),
-                    to_pubkey=dest_pubkey,
-                    lamports=1_000_000_000
-                )
+        ix = transfer(
+            TransferParams(
+                from_pubkey=treasury.pubkey(),
+                to_pubkey=dest_pubkey,
+                lamports=1_000_000_000
             )
         )
-        txn.sign(treasury)
 
-        # Send transaction
-        result = await client.send_transaction(txn, treasury)
+        msg = Message([ix], treasury.pubkey())
+        txn = SoldersTransaction([treasury], msg, blockhash)
+
+        result = await client.send_transaction(txn)
         await client.close()
 
         tx_sig = result.value
-
-        # Record usage
         await record_faucet_request(wallet_address)
 
         await update.message.reply_text(
@@ -255,7 +243,8 @@ async def faucet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Gagal hantar SOL.\nError: {str(e)}"
+            f"❌ Gagal hantar SOL.\nError: `{str(e)}`",
+            parse_mode="Markdown"
         )
 
 
@@ -291,11 +280,27 @@ async def checkbalance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Gagal check balance.\nError: {str(e)}")
+        await update.message.reply_text(
+            f"❌ Gagal check balance.\nError: `{str(e)}`",
+            parse_mode="Markdown"
+        )
+
+
+async def track_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    await get_or_create_user(user.id, user.username or user.first_name)
+    today = date.today().isoformat()
+    if update.message.reply_to_message:
+        await upsert_daily(user.id, today, "replies", 3, 15)
+    else:
+        await upsert_daily(user.id, today, "messages", 1, 20)
 
 
 async def post_init(app):
     await init_db()
+
 
 def main():
     app = ApplicationBuilder()\
@@ -309,15 +314,16 @@ def main():
     app.add_handler(CommandHandler("rank", rank_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("submit", submit))
-    app.add_handler(CommandHandler("faucet", faucet))
-    app.add_handler(CommandHandler("checkbalance", checkbalance))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("reject", reject))
+    app.add_handler(CommandHandler("faucet", faucet))
+    app.add_handler(CommandHandler("checkbalance", checkbalance))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message))
 
     print("Bot running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

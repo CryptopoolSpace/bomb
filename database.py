@@ -35,6 +35,14 @@ async def init_db():
                 submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        await db.execute("""
+    CREATE TABLE IF NOT EXISTS faucet_requests (
+        wallet_address TEXT PRIMARY KEY,
+        last_request_date TEXT
+    )
+""")
+
         await db.commit()
 
 async def get_or_create_user(user_id, username):
@@ -206,3 +214,28 @@ async def reject_submission(sub_id):
             UPDATE submissions SET status='rejected' WHERE id=?
         """, (sub_id,))
         await db.commit()
+
+async def can_request_faucet(wallet_address: str) -> bool:
+    from datetime import date
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT last_request_date FROM faucet_requests WHERE wallet_address=?",
+            (wallet_address,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return True
+            return row[0] != today
+
+async def record_faucet_request(wallet_address: str):
+    from datetime import date
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO faucet_requests (wallet_address, last_request_date)
+            VALUES (?, ?)
+            ON CONFLICT(wallet_address) DO UPDATE SET last_request_date=?
+        """, (wallet_address, today, today))
+        await db.commit()
+

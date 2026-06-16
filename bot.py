@@ -15,6 +15,17 @@ from database import (
     approve_submission, reject_submission,
     get_today_activity
 )
+import base58
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from solana.transaction import Transaction
+from solana.system_program import transfer, TransferParams
+from database import can_request_faucet, record_faucet_request
+
+TREASURY_PRIVATE_KEY = os.getenv("TREASURY_PRIVATE_KEY")
+SOLANA_RPC = "https://api.devnet.solana.com"
+
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -37,19 +48,22 @@ def get_tier(points):
     if points >= 50:   return "🌱 Bronze"
     return "❌ Inactive"
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await get_or_create_user(user.id, user.username or user.first_name)
     await update.message.reply_text(
-        f"👋 Yo {user.first_name}!\n\n"
-        "Selamat datang ke Beta Tester Bot 🚀\n\n"
-        "📋 Commands:\n"
-        "/score — Score kau hari ni\n"
-        "/rank — Rank & tier kau\n"
-        "/leaderboard — Top 20\n"
-        "/submit [link] — Submit social proof\n"
-        "/rules — Cara kira points"
-    )
+    f"👋 Yo {user.first_name}!\n\n"
+    "Selamat datang ke Beta Tester Bot 🚀\n\n"
+    "📋 Commands:\n"
+    "/score — Score kau hari ni\n"
+    "/rank — Rank & tier kau\n"
+    "/leaderboard — Top 20\n"
+    "/submit [link] — Submit social proof\n"
+    "/rules — Cara kira points\n"
+    "/faucet [wallet] — Dapat 1 SOL devnet (1x/hari)\n"
+    "/checkbalance [wallet] — Check balance devnet"
+)
+
 
 async def rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -164,6 +178,122 @@ async def track_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await upsert_daily(user.id, today, "messages", 1, 20)
 
+async def faucet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "❌ Usage: /faucet <wallet_address>\n"
+            "Contoh: /faucet 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs"
+        )
+        return
+
+    wallet_address = ctx.args[0].strip()
+
+    # Validate wallet address
+    try:
+        dest_pubkey = Pubkey.from_string(wallet_address)
+    except Exception:
+        await update.message.reply_text("❌ Wallet address tidak valid.")
+        return
+
+    # Check cooldown
+    allowed = await can_request_faucet(wallet_address)
+    if not allowed:
+        await update.message.reply_text(
+            f"⏳ Wallet ini dah request hari ni.\n"
+            f"Limit: 1 SOL per wallet per hari.\n"
+            f"Cuba lagi esok!"
+        )
+        return
+
+    await update.message.reply_text("⏳ Processing... Tunggu sekejap.")
+
+    try:
+        # Load treasury keypair
+        secret = base58.b58decode(TREASURY_PRIVATE_KEY)
+        treasury = Keypair.from_bytes(secret)
+
+        client = AsyncClient(SOLANA_RPC)
+
+        # Get latest blockhash
+        blockhash_resp = await client.get_latest_blockhash()
+        blockhash = blockhash_resp.value.blockhash
+
+        # Build transfer transaction (1 SOL = 1_000_000_000 lamports)
+        txn = Transaction()
+        txn.recent_blockhash = blockhash
+        txn.fee_payer = treasury.pubkey()
+        txn.add(
+            transfer(
+                TransferParams(
+                    from_pubkey=treasury.pubkey(),
+                    to_pubkey=dest_pubkey,
+                    lamports=1_000_000_000
+                )
+            )
+        )
+        txn.sign(treasury)
+
+        # Send transaction
+        result = await client.send_transaction(txn, treasury)
+        await client.close()
+
+        tx_sig = result.value
+
+        # Record usage
+        await record_faucet_request(wallet_address)
+
+        await update.message.reply_text(
+            f"✅ *1 SOL dihantar!*\n\n"
+            f"👛 Wallet: `{wallet_address}`\n"
+            f"🔗 TX: `{tx_sig}`\n\n"
+            f"[Tengok kat Solscan](https://solscan.io/tx/{tx_sig}?cluster=devnet)",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Gagal hantar SOL.\nError: {str(e)}"
+        )
+
+
+async def checkbalance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "❌ Usage: /checkbalance <wallet_address>\n"
+            "Contoh: /checkbalance 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs"
+        )
+        return
+
+    wallet_address = ctx.args[0].strip()
+
+    try:
+        pubkey = Pubkey.from_string(wallet_address)
+    except Exception:
+        await update.message.reply_text("❌ Wallet address tidak valid.")
+        return
+
+    try:
+        client = AsyncClient(SOLANA_RPC)
+        resp = await client.get_balance(pubkey)
+        await client.close()
+
+        lamports = resp.value
+        sol = lamports / 1_000_000_000
+
+        await update.message.reply_text(
+            f"💰 *Devnet Balance*\n\n"
+            f"👛 `{wallet_address}`\n"
+            f"⚡ {sol:.4f} SOL",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal check balance.\nError: {str(e)}")
+
+
 async def post_init(app):
     await init_db()
 
@@ -179,6 +309,8 @@ def main():
     app.add_handler(CommandHandler("rank", rank_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("submit", submit))
+    app.add_handler(CommandHandler("faucet", faucet))
+    app.add_handler(CommandHandler("checkbalance", checkbalance))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("reject", reject))
